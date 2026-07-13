@@ -5,6 +5,8 @@
 批量注册 Grok 账号，注册成功后自动把 OAuth 凭证写入 [CLIProxyAPI (CPA)](https://github.com/router-for-me/CLIProxyAPI)：支持本地 auth 目录热加载，也支持 Management API 远程上传。
 
 <p>
+  <a href="https://github.com/Git-creat7/grokRegister-cpa/stargazers"><img src="https://img.shields.io/github/stars/Git-creat7/grokRegister-cpa?style=flat&logo=github" alt="GitHub stars"></a>
+  <a href="https://github.com/Git-creat7/grokRegister-cpa/network/members"><img src="https://img.shields.io/github/forks/Git-creat7/grokRegister-cpa?style=flat&logo=github" alt="GitHub forks"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
   <img src="https://img.shields.io/badge/Python-3.9%2B-3776AB.svg" alt="Python 3.9+">
   <img src="https://img.shields.io/badge/Interface-GUI%20%2B%20CLI-success.svg" alt="GUI + CLI">
@@ -53,6 +55,11 @@ cp config.example.json config.json
 ```
 
 编辑 `config.json` 后运行。
+
+### Windows 一键启动
+
+1. 按 [DEPLOYMENT.md](DEPLOYMENT.md) 用 Python 3.13 创建 `.venv` 并安装依赖
+2. 双击 `start-gui.cmd` 开图形界面，或 `start-cli.cmd` 开命令行（输入 `start` 开始）
 
 ## 配置
 
@@ -200,7 +207,7 @@ python grok_register_ttk.py cli
 python grok_register_ttk.py
 ```
 
-可在界面里改 CPA 开关、auth 目录、远程地址与管理密钥。
+可在界面里改：邮箱服务商、代理、Cloudflare（API Base / 鉴权 / 收信域名 / 全局密码）、CPA 开关、auth 目录、远程地址与管理密钥。点击「开始注册」时会写回 `config.json`。
 
 ## 输出文件
 
@@ -251,6 +258,12 @@ CLI 只是不启动 Tk；注册页、Turnstile、SSO 仍依赖真实浏览器。
 **国内服务器调模型超时**  
 入库成功只说明凭证到了 CPA；调用上游 `cli-chat-proxy.grok.com` 还需服务器出网可达（或配置 CPA `proxy-url`）。
 
+**CPA 返回 `503 auth_unavailable: no auth available`**  
+不是网络超时，而是 CPA 当前没有可用的 xAI auth。检查：auth 是否写入并被热加载、token 是否带 `referrer=grok-build`、账号是否 403 权限拒绝或 429 免费额度耗尽。free 号走 `cli-chat-proxy` 的 build 通道，额度与权限由上游控制，可能抖动。
+
+**chat 报 `permission-denied` / Access to the chat endpoint is denied**  
+token 缺 `referrer=grok-build`，或 `base_url` 误指向 `api.x.ai`。用本仓库授权码流程重转覆盖对应 `xai-<email>.json`。
+
 ## 目录结构
 
 ```text
@@ -260,9 +273,16 @@ CLI 只是不启动 Tk；注册页、Turnstile、SSO 仍依赖真实浏览器。
 ├── cf_mail_debug.py          # Cloudflare 邮箱调试
 ├── config.example.json
 ├── requirements.txt
+├── start-gui.cmd             # Windows 启动 GUI
+├── start-cli.cmd             # Windows 启动 CLI
+├── DEPLOYMENT.md             # 本机 / Windows 部署
 ├── tests/
 └── assets/banner.png
 ```
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=Git-creat7/grokRegister-cpa&type=Date)](https://star-history.com/#Git-creat7/grokRegister-cpa&Date)
 
 ## License
 
