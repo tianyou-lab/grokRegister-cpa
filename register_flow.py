@@ -102,7 +102,7 @@ return candidates[0].text || true;
             if log_callback:
                 detail = f": {clicked}" if isinstance(clicked, str) else ""
                 log_callback(f"[*] 已点击「使用邮箱注册」按钮{detail}")
-            sleep_with_cancel(2, cancel_callback)
+            sleep_with_cancel(0.6, cancel_callback)
             return True
 
         if log_callback:
@@ -160,7 +160,8 @@ def open_signup_page(log_callback=None, cancel_callback=None):
                 pass
             raise Exception(f"打开注册页失败: {e2}") from e2
 
-    sleep_with_cancel(2, cancel_callback)
+    # 页面已 doc_loaded，短等即可；过长 sleep 会造成「进页卡顿」
+    sleep_with_cancel(0.4, cancel_callback)
     if log_callback:
         log_callback(f"[*] 当前URL: {active_page().url if active_page() else ''}")
     click_email_signup_button(
@@ -1088,22 +1089,42 @@ return String(cfInput.value || '').trim().length;
     raise Exception("最终注册页资料填写失败")
 
 
-def wait_for_sso_cookie(timeout=45, log_callback=None, cancel_callback=None):
-    deadline = time.time() + timeout
+def wait_for_sso_cookie(timeout=55, log_callback=None, cancel_callback=None):
+    """等注册完成后的 sso cookie。
+
+    关键：不要一看到「正在登录」就强制 page.get(grok.com)，
+    那会打断 accounts.x.ai 的 redirect / Set-Cookie 链，导致 grok.com 只剩匿名 cookie。
+    策略：accounts 短 hold（~7s）→ 点继续 → 轻量跳 grok（最多 2 次）。
+    """
+    deadline = time.time() + max(int(timeout or 55), 20)
     started = time.time()
     last_seen_names = set()
     last_submit_retry = 0.0
     last_cf_retry_at = 0.0
     last_heartbeat = 0.0
-    last_signin_nudge = 0.0
+    last_signin_log = 0.0
+    last_back_click = 0.0
+    last_grok_nudge = 0.0
+    last_continue_click = 0.0
+    grok_nudge_count = 0
     final_no_submit_state = ""
     final_no_submit_since = None
-    final_no_submit_timeout = 25
+    final_no_submit_timeout = 18
+    # 短 hold：给 Set-Cookie 留窗口，又不拖慢成功路径
+    accounts_hold_seconds = 7
+    max_grok_nudges = 2
+
+    def _current_url():
+        try:
+            return str(getattr(page, "url", "") or "")
+        except Exception:
+            return ""
 
     def _read_sso_from_cookies():
         cookies = page.cookies(all_domains=True, all_info=True) or []
         names = set()
         sso_val = ""
+        sso_rw_val = ""
         for item in cookies:
             if isinstance(item, dict):
                 name = str(item.get("name", "")).strip()
@@ -1115,27 +1136,131 @@ def wait_for_sso_cookie(timeout=45, log_callback=None, cancel_callback=None):
                 names.add(name)
             if name == "sso" and value and not sso_val:
                 sso_val = value
-        return sso_val, names
+            if name == "sso-rw" and value and not sso_rw_val:
+                sso_rw_val = value
+        # 优先 sso；少数情况下只有 sso-rw
+        return (sso_val or sso_rw_val), names
+
+    def _page_is_signing_in():
+        try:
+            return bool(
+                page.run_js(
+                    r"""
+const t = ((document.body && document.body.innerText) || '').replace(/\s+/g, '');
+const lower = t.toLowerCase();
+return t.includes('您正在登录') || t.includes('正在登录')
+  || lower.includes('signingyouin') || lower.includes('signinginin')
+  || lower.includes('signing in') || lower.includes('logging in')
+  || lower.includes('redirecting');
+                    """
+                )
+            )
+        except Exception:
+            return False
+
+    def _click_continue_if_any():
+        """点「继续 / Continue / 前往 Grok」类按钮，推动自然 redirect。"""
+        try:
+            return page.run_js(
+                r"""
+function isVisible(node) {
+  if (!node) return false;
+  const style = window.getComputedStyle(node);
+  if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+  const rect = node.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+}
+const nodes = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="submit"]'));
+const btn = nodes.find((n) => {
+  if (!isVisible(n) || n.disabled) return false;
+  const t = ((n.innerText || n.textContent || '') + ' '
+    + (n.getAttribute('aria-label') || '') + ' '
+    + (n.getAttribute('href') || '')).replace(/\s+/g, ' ').trim().toLowerCase();
+  const compact = t.replace(/\s+/g, '');
+  if (compact.includes('返回') || t.includes('back') || t.includes('return')) return false;
+  return compact.includes('继续') || compact.includes('前往') || compact.includes('打开')
+    || t.includes('continue') || t.includes('proceed') || t.includes('go to')
+    || t.includes('grok.com') || compact.includes('开始使用');
+});
+if (!btn) return false;
+btn.click();
+return true;
+                """
+            )
+        except Exception:
+            return False
+
+    def _click_back_if_any():
+        try:
+            return page.run_js(
+                r"""
+function isVisible(node) {
+  if (!node) return false;
+  const style = window.getComputedStyle(node);
+  if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+  const rect = node.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+}
+const nodes = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+const btn = nodes.find((n) => {
+  if (!isVisible(n) || n.disabled) return false;
+  const t = ((n.innerText || n.textContent || '') + ' ' + (n.getAttribute('aria-label') || '')).replace(/\s+/g, '');
+  const lower = t.toLowerCase();
+  return t.includes('返回') || lower.includes('back') || lower.includes('return');
+});
+if (!btn) return false;
+btn.click();
+return true;
+                """
+            )
+        except Exception:
+            return False
+
+    def _nudge_grok_once(reason):
+        nonlocal grok_nudge_count, last_grok_nudge
+        if grok_nudge_count >= max_grok_nudges:
+            return ""
+        if log_callback:
+            log_callback(f"[*] {reason}，轻量打开 grok.com（第 {grok_nudge_count + 1}/{max_grok_nudges} 次）...")
+        try:
+            page.get("https://grok.com/")
+            try:
+                page.wait.doc_loaded()
+            except Exception:
+                pass
+            sleep_with_cancel(1.0, cancel_callback)
+            grok_nudge_count += 1
+            last_grok_nudge = time.time()
+            sso_val, names = _read_sso_from_cookies()
+            last_seen_names.update(names)
+            return sso_val
+        except Exception as nav_exc:
+            grok_nudge_count += 1
+            last_grok_nudge = time.time()
+            if log_callback:
+                log_callback(f"[Debug] 跳转 grok.com 取 sso 失败: {nav_exc}")
+            return ""
 
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
         try:
             refresh_active_page()
             if active_page() is None:
-                sleep_with_cancel(1, cancel_callback)
+                sleep_with_cancel(0.5, cancel_callback)
                 continue
 
             now = time.time()
+            elapsed = now - started
+            cur_url = _current_url()
+            on_accounts = ("accounts.x.ai" in cur_url) or ("auth.x.ai" in cur_url)
+            on_grok = "grok.com" in cur_url
+
             # 心跳：避免长时间无日志像卡死
-            if log_callback and now - last_heartbeat >= 8:
+            if log_callback and now - last_heartbeat >= 5:
                 last_heartbeat = now
-                try:
-                    cur_url = str(getattr(page, "url", "") or "")
-                except Exception:
-                    cur_url = ""
                 remain = max(int(deadline - now), 0)
                 log_callback(
-                    f"[*] 等待 sso 中... 已等 {int(now - started)}s，剩余 {remain}s | url={cur_url[:80]}"
+                    f"[*] 等待 sso 中... 已等 {int(elapsed)}s，剩余 {remain}s | url={cur_url[:90]}"
                 )
 
             # 优先读 cookie（登录中页面也可能已写入 sso）
@@ -1146,40 +1271,67 @@ def wait_for_sso_cookie(timeout=45, log_callback=None, cancel_callback=None):
                     log_callback("[*] 已获取到 sso cookie")
                 return sso_val
 
-            # 「您正在登录」页：过一会儿主动跳 grok.com 完成会话
-            try:
-                signin_hint = page.run_js(
-                    r"""
-const t = ((document.body && document.body.innerText) || '').replace(/\s+/g, '');
-const lower = t.toLowerCase();
-if (t.includes('您正在登录') || t.includes('正在登录') || lower.includes('signingyouin') || lower.includes('signing in')) {
-  return true;
-}
-return false;
-                    """
-                )
-            except Exception:
-                signin_hint = False
-            if signin_hint and now - last_signin_nudge >= 12:
-                last_signin_nudge = now
-                if log_callback:
-                    log_callback("[*] 页面显示正在登录，尝试打开 grok.com 以落稳 sso ...")
-                try:
-                    page.get("https://grok.com/")
-                    try:
-                        page.wait.doc_loaded()
-                    except Exception:
-                        pass
-                    sleep_with_cancel(2, cancel_callback)
-                    sso_val, names = _read_sso_from_cookies()
-                    last_seen_names |= names
+            signin_hint = _page_is_signing_in()
+
+            # 阶段1：accounts 上「正在登录」→ 短 hold，禁止立刻跳 grok
+            if signin_hint and on_accounts and elapsed < accounts_hold_seconds:
+                if log_callback and now - last_signin_log >= 3:
+                    last_signin_log = now
+                    remain_hold = max(int(accounts_hold_seconds - elapsed), 0)
+                    log_callback(
+                        f"[*] 页面显示正在登录，先在 accounts.x.ai 等待 sso"
+                        f"（再等 {remain_hold}s 后可跳 grok.com）..."
+                    )
+                # hold 过半后再点「继续」，避免过早打断
+                if elapsed >= 3 and now - last_continue_click >= 4:
+                    last_continue_click = now
+                    if _click_continue_if_any() and log_callback:
+                        log_callback("[*] 已点击继续/前往类按钮，等待 redirect...")
+                sleep_with_cancel(0.4, cancel_callback)
+                continue
+
+            # 阶段2：hold 结束仍在 accounts 且无 sso → 先点继续，再轻量跳 grok（最多 2 次）
+            if on_accounts and elapsed >= accounts_hold_seconds:
+                if now - last_continue_click >= 5:
+                    last_continue_click = now
+                    if _click_continue_if_any() and log_callback:
+                        log_callback("[*] accounts 等待结束，已点击继续/前往类按钮...")
+                        sleep_with_cancel(1.2, cancel_callback)
+                        sso_val, names = _read_sso_from_cookies()
+                        last_seen_names |= names
+                        if sso_val:
+                            if log_callback:
+                                log_callback("[*] 已获取到 sso cookie")
+                            return sso_val
+                if (
+                    grok_nudge_count < max_grok_nudges
+                    and now - last_grok_nudge >= 8
+                    and (signin_hint or elapsed >= accounts_hold_seconds + 2)
+                ):
+                    sso_val = _nudge_grok_once("accounts 等待结束仍无 sso")
                     if sso_val:
                         if log_callback:
                             log_callback("[*] 已获取到 sso cookie")
                         return sso_val
-                except Exception as nav_exc:
-                    if log_callback:
-                        log_callback(f"[Debug] 跳转 grok.com 取 sso 失败: {nav_exc}")
+
+            # 阶段3：已在 grok.com 仍无 sso → 少次「返回」或再刷（不反复硬刷）
+            if on_grok and not sso_val:
+                if signin_hint and now - last_back_click >= 10:
+                    last_back_click = now
+                    if _click_back_if_any():
+                        if log_callback:
+                            log_callback("[*] grok 页无 sso，已点击「返回」尝试重新推进")
+                        sleep_with_cancel(0.8, cancel_callback)
+                elif (
+                    grok_nudge_count < max_grok_nudges
+                    and elapsed >= accounts_hold_seconds + 12
+                    and now - last_grok_nudge >= 10
+                ):
+                    sso_val = _nudge_grok_once("grok.com 仍为匿名会话")
+                    if sso_val:
+                        if log_callback:
+                            log_callback("[*] 已获取到 sso cookie")
+                        return sso_val
 
             # 仍停留在“完成注册”页时，若 Cloudflare 已通过，周期性重试点击提交
             if now - last_submit_retry >= 2.5:
@@ -1295,10 +1447,12 @@ return String(cfInput.value || '').trim().length;
             if log_callback:
                 log_callback(f"[Debug] 等待 sso 时异常: {exc}")
 
-        sleep_with_cancel(1, cancel_callback)
+        sleep_with_cancel(0.4, cancel_callback)
 
+    final_url = _current_url()
     raise Exception(
-        f"等待超时：未获取到 sso cookie。已看到 cookies: {sorted(last_seen_names)}"
+        "sso_timeout：等待超时未获取到 sso cookie（多为登录链被打断或未真正建号）。"
+        f" url={final_url[:120]} cookies={sorted(last_seen_names)}"
     )
 
 

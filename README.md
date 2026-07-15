@@ -68,6 +68,28 @@ cp config.example.json config.json
 | `cpa_auto_add` | 是否注册后 SSO→CPA auth（关则只保存 SSO） |
 | `register_workers` | 并发浏览器数，默认 1，最大 8 |
 | `debug_mode` | 调试模式：强制单账号、结束后不关闭浏览器 |
+| `log_level` | `info`（默认，隐藏 `[Debug]`）/ `debug`（全量日志） |
+
+### 并发 / 调试 / 连通性
+
+**并发 `register_workers`**
+- 每个 worker 独立 Chrome 用户目录，降低资料目录冲突
+- 实际并发不超过注册数量；worker 启动错开约 2 秒
+- 浏览器连续启动失败时日志会提示降低并发
+
+**调试模式 `debug_mode`**
+- 强制数量=1、并发=1
+- 任务结束后**不关闭**浏览器，方便你检查页面
+- 中途换邮箱仍会 `restart_browser`（强制重启）
+
+**连通性检查**
+- GUI「连通性检查」或开始注册前自动跑
+- 检查项：代理 TCP/出站、邮箱 API、CPA 本地目录/远程 Management API
+- 失败默认只警告，不强制拦截开跑
+
+**NSFW**
+- 自动开启失败**不阻塞**账号保存与 CPA 入库
+- 可网页手动开启；批量时可关掉「注册后开启 NSFW」提速
 | `cpa_auth_dir` | 本地 CPA auth 目录；写入 `xai-<email>.json`，可留空 |
 | `cpa_remote_url` | 远程 CPA 地址，如 `http://你的CPA地址:8317` |
 | `cpa_management_key` | 远程 CPA 管理密钥（`remote-management.secret-key` 明文） |

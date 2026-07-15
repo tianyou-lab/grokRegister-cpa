@@ -25,6 +25,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import secrets
 import sys
 import time
@@ -54,8 +55,23 @@ GROK_REFERRER = "grok-build"
 GROK_PLAN = "generic"
 GROK_VERSION = "0.2.93"
 GROK_TOKEN_UA = f"grok-pager/{GROK_VERSION} grok-shell/{GROK_VERSION} (linux; x86_64)"
-# consent 提交用的 Next.js Server Action ID
-NEXT_ACTION_ID = "4005315a1d7e426de592990bb54bb37471f39dd6d2"
+# consent 提交用的 Next.js Server Action ID（快速路径；失效时再从 consent 页 JS 动态解析）
+# 2026-07 实测 createServerReference 在 accounts.x.ai chunks 内，HTML 里的 400b2e4e... 不是 consent allow
+NEXT_ACTION_ID = "401b73e22a5e68737d0037e1aa449fef82cd1b35fb"
+_working_next_action_id = NEXT_ACTION_ID
+_NEXT_ACTION_RE = re.compile(
+    r'(?:\$ACTION_ID_|next-action["\']?\s*[:=]\s*["\']|["\'])([0-9a-f]{40,44})["\']',
+    re.I,
+)
+_CREATE_SERVER_REF_RE = re.compile(
+    r'createServerReference\)?\(["\']([0-9a-f]{40,44})["\']',
+    re.I,
+)
+_CALL_SERVER_RE = re.compile(
+    r'["\']([0-9a-f]{40,44})["\']\s*,\s*(?:callServer|findSourceMapURL)',
+    re.I,
+)
+_SCRIPT_SRC_RE = re.compile(r'src=["\']([^"\']+)["\']', re.I)
 
 # --- CLIProxyAPI (CPA) 扁平格式常量 ------------------------------------------
 # CPA 的 internal/auth/xai/token.go TokenStorage 读的是扁平字段。
@@ -133,13 +149,102 @@ def _parse_consent_code(body: str) -> str | None:
     return None
 
 
+def _extract_next_action_ids(html: str) -> list[str]:
+    """仅从 HTML 文本抽哈希（弱信号；真正 id 多在 JS chunk）。"""
+    found: list[str] = []
+    seen: set[str] = set()
+    text = html or ""
+
+    def _add(val: str):
+        v = (val or "").strip().lower()
+        if len(v) < 40 or v in seen:
+            return
+        seen.add(v)
+        found.append(v)
+
+    for m in _CREATE_SERVER_REF_RE.finditer(text):
+        _add(m.group(1))
+    for m in _CALL_SERVER_RE.finditer(text):
+        _add(m.group(1))
+    for m in _NEXT_ACTION_RE.finditer(text):
+        _add(m.group(1))
+    if NEXT_ACTION_ID and NEXT_ACTION_ID.lower() not in seen:
+        found.append(NEXT_ACTION_ID.lower())
+    return found
+
+
+def _discover_action_ids_from_js(session, html: str, base_url: str = "https://accounts.x.ai", log=None) -> list[str]:
+    """从 consent 页引用的 /_next/static/chunks/*.js 解析 createServerReference 的 action id。
+
+    HTML 内嵌的 40 位 hex 经常是错误候选（会 404）；真实 allow consent 在 JS 里。
+    """
+    found: list[str] = []
+    seen: set[str] = set()
+    priority: list[str] = []  # consent/oauth 相关 chunk 里的 id 优先
+
+    def _add(val: str, prefer: bool = False):
+        v = (val or "").strip().lower()
+        if len(v) < 40 or v in seen:
+            return
+        seen.add(v)
+        if prefer:
+            priority.append(v)
+        else:
+            found.append(v)
+
+    srcs = _SCRIPT_SRC_RE.findall(html or "")
+    # 优先扫可能含 consent 逻辑的 chunk；其余也扫但限数量
+    scored: list[tuple[int, str]] = []
+    for src in srcs:
+        low = src.lower()
+        score = 0
+        if "chunk" not in low and "/_next/" not in low:
+            continue
+        if any(k in low for k in ("consent", "oauth", "auth", "login", "sign")):
+            score += 5
+        scored.append((score, src))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+
+    fetched = 0
+    max_fetch = 40
+    for score, src in scored:
+        if fetched >= max_fetch:
+            break
+        full = src if src.startswith("http") else urllib.parse.urljoin(base_url.rstrip("/") + "/", src.lstrip("/"))
+        try:
+            resp = session.get(full, impersonate="chrome", timeout=15)
+            text = str(resp.text or "")
+        except Exception:
+            continue
+        fetched += 1
+        prefer = score > 0 or ("consent" in text.lower() and "oauth" in text.lower())
+        # 含 allow + createServerReference 的 chunk 更优先
+        if "createServerReference" in text or "callServer" in text:
+            prefer = True
+        for m in _CREATE_SERVER_REF_RE.finditer(text):
+            _add(m.group(1), prefer=prefer)
+        for m in _CALL_SERVER_RE.finditer(text):
+            _add(m.group(1), prefer=prefer)
+
+    # HTML 弱信号放后
+    for aid in _extract_next_action_ids(html):
+        _add(aid, prefer=False)
+
+    ordered = priority + [x for x in found if x not in priority]
+    if log:
+        log(f"  [*] 从 JS chunks 解析 Next-Action {len(ordered)} 个（扫 {fetched} 个脚本）")
+    return ordered
+
+
 def sso_to_token(sso_cookie: str, proxy: str = "", log=print) -> dict | None:
     """SSO cookie → token dict (access/refresh/expires_in)。
 
     使用授权码流程（Authorization Code + PKCE）：
     authorize 注入 referrer=grok-build + plan=generic，
-    consent 提交 referrer 置空。proxy 非空时全程走代理。
+    consent 优先复用已成功的 Next-Action，失效时才扫描页面 JS 并重试。
     """
+    global _working_next_action_id
+
     proxies = {"http": proxy, "https": proxy} if proxy else None
     s = requests.Session()
     if proxies:
@@ -175,23 +280,52 @@ def sso_to_token(sso_cookie: str, proxy: str = "", log=print) -> dict | None:
         "scope": SCOPES,
         "state": state,
     })
-    try:
-        r = s.get(
-            f"{OIDC_ISSUER}/oauth2/authorize?{authorize_params}",
-            impersonate="chrome",
-            timeout=15,
-            allow_redirects=True,
-        )
-    except Exception as e:
-        log(f"  ❌ authorize 异常: {e}")
+    authorize_url = f"{OIDC_ISSUER}/oauth2/authorize?{authorize_params}"
+
+    def _open_consent(discover_actions=False):
+        try:
+            resp = s.get(
+                authorize_url,
+                impersonate="chrome",
+                timeout=15,
+                allow_redirects=True,
+            )
+        except Exception as e:
+            log(f"  ❌ authorize 异常: {e}")
+            return None, "", []
+        url = str(resp.url)
+        if "sign-in" in url or "sign-up" in url:
+            log("  ❌ sso 无效")
+            return None, url, []
+        if "/oauth2/consent" not in url:
+            log(f"  ❌ authorize 未进入 consent: {url}")
+            return None, url, []
+        html = str(resp.text or "")
+        # consent 实际在 accounts.x.ai（从 auth.x.ai authorize 重定向）
+        base = "https://accounts.x.ai"
+        if "auth.x.ai" in url and "accounts.x.ai" not in url:
+            base = "https://auth.x.ai"
+        if discover_actions:
+            action_ids = _discover_action_ids_from_js(s, html, base_url=base, log=log)
+        else:
+            action_ids = []
+            cached = str(_working_next_action_id or "").strip().lower()
+            if cached:
+                action_ids.append(cached)
+            for action_id in _extract_next_action_ids(html):
+                if action_id not in action_ids:
+                    action_ids.append(action_id)
+            log(f"  [*] consent 快速路径 Next-Action {len(action_ids)} 个（跳过 JS chunks 扫描）")
+        return resp, url, action_ids
+
+    r, final_url, action_ids = _open_consent()
+    if r is None:
         return None
-    final_url = str(r.url)
-    if "sign-in" in final_url or "sign-up" in final_url:
-        log("  ❌ sso 无效")
-        return None
-    if "/oauth2/consent" not in final_url:
-        log(f"  ❌ authorize 未进入 consent: {final_url}")
-        return None
+    if not action_ids:
+        action_ids = [NEXT_ACTION_ID]
+        log(f"  ⚠️ 未解析到 Next-Action，使用 fallback {NEXT_ACTION_ID[:12]}...")
+    else:
+        log(f"  [*] consent Next-Action 候选 {len(action_ids)} 个（首个 {action_ids[0][:12]}...）")
 
     # 2) 提交 consent（allow），拿 authorization code
     # consent 也必须带 referrer=grok-build，否则 JWT claim 为 None
@@ -208,30 +342,65 @@ def sso_to_token(sso_cookie: str, proxy: str = "", log=print) -> dict | None:
         "principalId": "",
         "referrer": GROK_REFERRER,
     }])
-    try:
-        r = s.post(
-            final_url,
-            data=consent_payload,
-            headers={
-                "Content-Type": "text/plain;charset=UTF-8",
-                "Accept": "text/x-component",
-                "Origin": "https://accounts.x.ai",
-                "Referer": final_url,
-                "Next-Action": NEXT_ACTION_ID,
-            },
-            impersonate="chrome",
-            timeout=15,
-            allow_redirects=True,
-        )
-    except Exception as e:
-        log(f"  ❌ consent 异常: {e}")
-        return None
-    if r.status_code < 200 or r.status_code >= 300:
-        log(f"  ❌ consent HTTP {r.status_code}: {str(r.text)[:200]}")
-        return None
-    code = _parse_consent_code(str(r.text))
+
+    code = None
+    last_err = ""
+    tried: set[str] = set()
+    # 最多 2 轮：第一轮优先试上次成功/内置 id；失败再重开 consent 扫 JS chunks。
+    for round_i in range(2):
+        if round_i > 0:
+            log("  [*] consent 失败，重新进入 authorize/consent 并解析 Next-Action...")
+            r, final_url, action_ids = _open_consent(discover_actions=True)
+            if r is None:
+                return None
+            if not action_ids:
+                action_ids = [NEXT_ACTION_ID]
+
+        for action_id in action_ids[:8]:
+            if action_id in tried:
+                continue
+            tried.add(action_id)
+            try:
+                r = s.post(
+                    final_url,
+                    data=consent_payload,
+                    headers={
+                        "Content-Type": "text/plain;charset=UTF-8",
+                        "Accept": "text/x-component",
+                        "Origin": "https://accounts.x.ai",
+                        "Referer": final_url,
+                        "Next-Action": action_id,
+                    },
+                    impersonate="chrome",
+                    timeout=15,
+                    allow_redirects=True,
+                )
+            except Exception as e:
+                last_err = f"consent 异常: {e}"
+                log(f"  ❌ {last_err}")
+                continue
+            body = str(r.text or "")
+            if r.status_code == 404 or "server action not found" in body.lower():
+                last_err = f"consent HTTP {r.status_code}: {body[:160]}"
+                log(f"  ⚠️ Next-Action {action_id[:12]}... 无效: {last_err}")
+                continue
+            if r.status_code < 200 or r.status_code >= 300:
+                last_err = f"consent HTTP {r.status_code}: {body[:200]}"
+                log(f"  ⚠️ {last_err}")
+                continue
+            code = _parse_consent_code(body)
+            if code:
+                _working_next_action_id = action_id
+                log(f"  [*] Next-Action {action_id[:12]}... 返回 authorization code")
+                break
+            # 200 但无 code：多半是别的 server action（如读用户信息），继续试
+            last_err = f"consent 未返回 code: {body[:180]}"
+            log(f"  ⚠️ Next-Action {action_id[:12]}... 非 allow 响应，继续试")
+        if code:
+            break
+
     if not code:
-        log(f"  ❌ consent 未返回 code: {str(r.text)[:200]}")
+        log(f"  ❌ consent 失败（已试 {len(tried)} 个 Next-Action）: {last_err}")
         return None
     log("  ✅ 授权确认")
 

@@ -7,6 +7,8 @@ import time
 from typing import Callable, List, Tuple
 from urllib.parse import urlparse
 
+from email_providers import cloudflare as cloudflare_provider
+
 CheckResult = Tuple[str, bool, str]  # name, ok, detail
 
 
@@ -62,8 +64,29 @@ def check_email_api(provider: str, config: dict, http_get: Callable, http_post: 
             if not path.startswith("/"):
                 path = "/" + path
             url = f"{base}{path}"
-            resp = http_get(url, timeout=10)
-            if resp.status_code >= 500:
+            api_key = str(config.get("cloudflare_api_key", "") or "")
+            auth_mode = str(config.get("cloudflare_auth_mode", "none") or "none")
+            custom_auth = str(config.get("cloudflare_custom_auth", "") or "")
+            headers = cloudflare_provider.build_headers(api_key, auth_mode, custom_auth)
+            params = cloudflare_provider.apply_auth_params({}, api_key, auth_mode)
+            resp = http_get(url, headers=headers, params=params, timeout=10)
+            if resp.status_code >= 400:
+                accounts_path = str(
+                    config.get("cloudflare_path_accounts", "/api/new_address")
+                    or "/api/new_address"
+                ).rstrip("/").lower()
+                direct_anonymous_create = (
+                    accounts_path.endswith("/new_address")
+                    and not api_key
+                    and not custom_auth
+                    and auth_mode.lower() == "none"
+                )
+                if direct_anonymous_create and resp.status_code in (401, 403):
+                    return (
+                        "邮箱API",
+                        True,
+                        f"Cloudflare 直建模式可用（domains HTTP {resp.status_code}，当前流程不依赖该接口）",
+                    )
                 return "邮箱API", False, f"Cloudflare HTTP {resp.status_code}"
             return "邮箱API", True, f"Cloudflare 可达 HTTP {resp.status_code}"
 
@@ -85,7 +108,7 @@ def check_email_api(provider: str, config: dict, http_get: Callable, http_post: 
             elif key:
                 headers["X-API-Key"] = key
             resp = http_get("https://maliapi.215.im/v1/domains", headers=headers, timeout=12)
-            ok = resp.status_code < 500
+            ok = resp.status_code < 400
             return "邮箱API", ok, f"YYDS HTTP {resp.status_code}"
 
         if provider == "mailnest":
@@ -98,14 +121,14 @@ def check_email_api(provider: str, config: dict, http_get: Callable, http_post: 
                 headers={"Authorization": f"Bearer {key}"},
                 timeout=12,
             )
-            return "邮箱API", resp.status_code < 500, f"MailNest 站点 HTTP {resp.status_code}"
+            return "邮箱API", resp.status_code < 400, f"MailNest 站点 HTTP {resp.status_code}"
 
         if provider == "cloudmail":
             url = str(config.get("cloudmail_url", "") or "").rstrip("/")
             if not url:
                 return "邮箱API", False, "未配置 cloudmail_url"
             resp = http_get(url, timeout=10)
-            return "邮箱API", resp.status_code < 500, f"CloudMail HTTP {resp.status_code}"
+            return "邮箱API", resp.status_code < 400, f"CloudMail HTTP {resp.status_code}"
 
         return "邮箱API", True, f"提供商 {provider} 跳过深度探测"
     except Exception as exc:

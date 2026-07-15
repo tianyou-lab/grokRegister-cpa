@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import gc
 import os
+import socket
+import tempfile
 import threading
 import time
+import uuid
 from typing import Callable, Optional, Tuple
 
 from DrissionPage import Chromium, ChromiumOptions
@@ -14,6 +17,9 @@ _tls = threading.local()
 _get_proxy: Optional[Callable[[], dict]] = None
 _is_debug: Optional[Callable[[], bool]] = None
 _extension_path: str = ""
+_start_fail_lock = threading.Lock()
+_start_fail_streak = 0
+_start_fail_threshold = 3
 
 
 def configure(get_proxies=None, is_debug=None, extension_path=""):
@@ -21,6 +27,24 @@ def configure(get_proxies=None, is_debug=None, extension_path=""):
     _get_proxy = get_proxies
     _is_debug = is_debug
     _extension_path = extension_path or ""
+
+
+def get_start_fail_streak() -> int:
+    with _start_fail_lock:
+        return _start_fail_streak
+
+
+def _note_start_success():
+    global _start_fail_streak
+    with _start_fail_lock:
+        _start_fail_streak = 0
+
+
+def _note_start_failure():
+    global _start_fail_streak
+    with _start_fail_lock:
+        _start_fail_streak += 1
+        return _start_fail_streak
 
 
 def _proxies() -> dict:
@@ -75,10 +99,45 @@ browser = _SessionProxy("browser")
 page = _SessionProxy("page")
 
 
-def create_browser_options():
+def _free_local_port() -> int:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+def create_browser_options(unique_profile=True):
+    """创建 ChromiumOptions。
+
+    注意：DrissionPage 下 set_user_data_path 会破坏 auto_port() 的 address
+    （触发 not enough values to unpack）。并发隔离应使用：
+    set_local_port(空闲端口) + set_user_data_path(独立目录)。
+    """
     options = ChromiumOptions()
-    options.auto_port()
     options.set_timeouts(base=1)
+    proxies = _proxies()
+    proxy = str(proxies.get("https") or proxies.get("http") or "").strip()
+    if proxy:
+        options.set_proxy(proxy)
+    if unique_profile:
+        profile_dir = os.path.join(
+            tempfile.gettempdir(),
+            "grok-register-chrome",
+            f"{os.getpid()}-{threading.get_ident()}-{uuid.uuid4().hex[:8]}",
+        )
+        os.makedirs(profile_dir, exist_ok=True)
+        port = _free_local_port()
+        options.set_local_port(port)
+        options.set_user_data_path(profile_dir)
+        _tls.profile_dir = profile_dir
+        _tls.debug_port = port
+    else:
+        options.auto_port()
     if _extension_path and os.path.exists(_extension_path):
         options.add_extension(_extension_path)
     return options
@@ -88,19 +147,22 @@ def start_browser(log_callback=None) -> Tuple[object, object]:
     last_exc = None
     for attempt in range(1, 5):
         try:
-            browser_obj = Chromium(create_browser_options())
+            browser_obj = Chromium(create_browser_options(unique_profile=True))
             tabs = browser_obj.get_tabs()
             page_obj = tabs[-1] if tabs else browser_obj.new_tab()
             set_browser_session(browser_obj, page_obj)
-            if log_callback and getattr(browser_obj, "user_data_path", None):
-                log_callback(f"[Debug] 当前浏览器资料目录: {browser_obj.user_data_path}")
+            _note_start_success()
+            profile = getattr(_tls, "profile_dir", None) or getattr(browser_obj, "user_data_path", None)
+            if log_callback and profile:
+                log_callback(f"[Debug] 当前浏览器资料目录: {profile}")
             if log_callback and attempt > 1:
                 log_callback(f"[*] 浏览器第 {attempt} 次启动成功")
             return browser_obj, page_obj
         except Exception as exc:
             last_exc = exc
+            streak = _note_start_failure()
             if log_callback:
-                log_callback(f"[Debug] 浏览器启动失败(第{attempt}/4次): {exc}")
+                log_callback(f"[Debug] 浏览器启动失败(第{attempt}/4次, 连续失败{streak}): {exc}")
             try:
                 cur = active_browser()
                 if cur is not None:
